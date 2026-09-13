@@ -1,0 +1,18 @@
+# Python & Jupyter
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints/
+
+# Virtual environments
+venv/
+env/
+.env
+
+# Backups and temporary files
+*.bak
+*.tmp
+
+# OS generated files
+.DS_Store
+Thumbs.db
