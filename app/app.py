@@ -174,24 +174,37 @@ def main():
         st.subheader("🩺 Diagnostic Classification Analysis")
         if clf_data:
             pipeline = clf_data['pipeline']
-            class_names = clf_data.get('class_names', ['MI', 'CD', 'HYP', 'STTC', 'NORM'])
             le = clf_data.get('label_encoder')
+            model_step = getattr(pipeline, 'named_steps', {}).get('model', pipeline)
+            if hasattr(model_step, 'classes_'):
+                raw_classes = list(model_step.classes_)
+                if le is not None:
+                    model_classes = list(le.inverse_transform(raw_classes))
+                else:
+                    model_classes = [str(c) for c in raw_classes]
+            else:
+                model_classes = clf_data.get('class_names', ['MI', 'CD', 'HYP', 'STTC', 'NORM'])
 
             # Prediction
+            X_val_input = input_df.values
             if le is not None:
-                preds_int = pipeline.predict(input_df)[0]
+                preds_int = pipeline.predict(X_val_input)[0]
                 pred_label = le.inverse_transform([preds_int])[0]
-                probs = pipeline.predict_proba(input_df)[0]
+                probs = pipeline.predict_proba(X_val_input)[0]
             else:
-                pred_label = pipeline.predict(input_df)[0]
-                probs = pipeline.predict_proba(input_df)[0]
+                pred_label = pipeline.predict(X_val_input)[0]
+                probs = pipeline.predict_proba(X_val_input)[0]
+
+            prob_map = {c: float(p) for c, p in zip(model_classes, probs)}
 
             badge_class = f"badge-{pred_label.lower()}"
             st.markdown(f"**Predicted Primary Pathology:** <span class='diagnosis-badge {badge_class}'>{pred_label}</span>", unsafe_allow_html=True)
             st.write("")
 
             st.write("### Diagnostic Probability Distribution:")
-            for cls_name, prob in zip(class_names, probs):
+            display_order = ['MI', 'CD', 'HYP', 'STTC', 'NORM']
+            for cls_name in display_order:
+                prob = prob_map.get(cls_name, 0.0)
                 st.write(f"**{cls_name}:** {prob * 100:.1f}%")
                 st.progress(float(prob))
         else:
