@@ -1,0 +1,11 @@
+Algorithm,Track,Accuracy,Precision_Weighted,Recall_Weighted,Weighted_F1,Macro_F1,ROC_AUC_OvR
+MLP,Part B (Ensemble/Neural),0.6108,0.5858,0.6108,0.5909,0.4711,0.8438
+XGBoost,Part B (Ensemble/Neural),0.6169,0.5933,0.6169,0.5909,0.4816,0.8405
+Random Forest,Part B (Ensemble/Neural),0.6094,0.5838,0.6094,0.5739,0.4495,0.8317
+Support Vector Classifier,Part A (Baseline),0.5657,0.5972,0.5657,0.5732,0.4893,0.8392
+AdaBoost,Part B (Ensemble/Neural),0.5832,0.5564,0.5832,0.5563,0.4542,0.8021
+Bagging,Part B (Ensemble/Neural),0.5909,0.5665,0.5909,0.5472,0.4219,0.8058
+Logistic Regression,Part A (Baseline),0.5197,0.5658,0.5197,0.5306,0.4488,0.8053
+K-Nearest Neighbors,Part A (Baseline),0.5683,0.5329,0.5683,0.5185,0.3914,0.7832
+Gaussian Naive Bayes,Part A (Baseline),0.5343,0.5305,0.5343,0.5096,0.4158,0.7727
+Decision Tree,Part A (Baseline),0.5031,0.5548,0.5031,0.4996,0.4185,0.7576
