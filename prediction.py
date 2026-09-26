@@ -1,11 +1,12 @@
 """
 ================================================================================
-PTB-XL ECG Diagnostic Prediction Engine
-Based on Classification Track (Part B: Advanced Ensembles & Neural Models)
+PTB-XL ECG Diagnostic & Prognostic Prediction Engine
+Classification (Part A & Part B Ensembles) + Biological Age Regression
 ================================================================================
 
-This module provides an inference and clinical decision-support interface
-for predicting the primary cardiac pathology from 12-lead ECG features.
+This module provides a unified inference and clinical decision-support interface
+for predicting the primary cardiac pathology and estimated biological patient age
+from 12-lead ECG features.
 
 Supported Diagnostic Superclasses:
   - MI   : Myocardial Infarction (Ischemia / Necrosis)
@@ -14,15 +15,18 @@ Supported Diagnostic Superclasses:
   - STTC : ST-T Wave Changes (Repolarization Abnormality)
   - NORM : Normal Sinus ECG
 
+Supported Regression Target:
+  - Biological Age (years) derived from 12-lead electrophysiological features
+
 Usage Examples:
-  CLI - Demo with sample clinical cases:
+  CLI - Clinical Demo with representative test cases:
     python prediction.py --demo
 
   CLI - Predict for a specific record in the dataset:
-    python prediction.py --ecg-id 8
+    python prediction.py --ecg-id 14314
 
   CLI - Predict from custom physiological parameters:
-    python prediction.py --hr 72 --pr 160 --qrs 130 --qtc 420 --st 0.15
+    python prediction.py --hr 72 --pr 160 --qrs 95 --qtc 410 --st -0.02 --t-area 0.008
 
   CLI - Batch predict from a CSV file:
     python prediction.py --csv path/to/features.csv --output results.csv
@@ -30,8 +34,8 @@ Usage Examples:
   Python API:
     from prediction import ECGPredictor
     predictor = ECGPredictor()
-    result = predictor.predict({'hr_bpm': 75.0, 'qrs_dur_mean_ms': 140.0, ...})
-    print(result['predicted_class'], result['probabilities'])
+    result = predictor.predict({'hr_bpm': 75.0, 'qrs_dur_mean_ms': 95.0, ...})
+    print(result['predicted_class'], result['confidence'], result['estimated_age'])
 ================================================================================
 """
 
@@ -39,6 +43,10 @@ import os
 import sys
 import argparse
 import warnings
+
+# Suppress warnings for clean CLI and module usage
+warnings.filterwarnings("ignore")
+
 import numpy as np
 import pandas as pd
 import joblib
@@ -67,14 +75,23 @@ GUARD_COLS = [
     "qt_mean_ms", "qt_std_ms", "qtc_mean_ms"
 ]
 
+# Canonical representative test-fold records for clinical demonstration
+REPRESENTATIVE_TEST_CASES = {
+    "MI": 14314,   # Acute anterior/inferior MI with ST elevation
+    "CD": 18499,   # Bundle branch block with severe QRS prolongation
+    "HYP": 2417,   # Left ventricular hypertrophy with strain pattern
+    "STTC": 6735,  # Non-specific repolarization anomaly with tachycardia
+    "NORM": 9010   # Healthy normal sinus electrocardiogram
+}
+
 
 class ECGPredictor:
     """
-    Inference engine that encapsulates pipeline loading, feature validation,
-    ratio engineering, guard handling, and clinical reasoning.
+    Unified inference engine that encapsulates pipeline loading, feature validation,
+    ratio engineering, guard handling, diagnostic classification, and biological age regression.
     """
 
-    def __init__(self, model_path=None, model_type="partB"):
+    def __init__(self, model_path=None, model_type="partB", reg_model_path=None):
         self.model_type = model_type
         if model_path is None:
             if model_type.lower() == "parta" and os.path.exists(FALLBACK_MODEL_PATH):
@@ -85,14 +102,16 @@ class ECGPredictor:
                 model_path = FALLBACK_MODEL_PATH
             else:
                 raise FileNotFoundError(
-                    f"No serialized model found at {DEFAULT_MODEL_PATH} or {FALLBACK_MODEL_PATH}. "
+                    f"No serialized classification model found at {DEFAULT_MODEL_PATH} or {FALLBACK_MODEL_PATH}. "
                     "Please ensure the models/ directory contains the trained pipeline."
                 )
 
         self.model_path = model_path
+        self.reg_model_path = reg_model_path or REGRESSION_MODEL_PATH
         self._load_artifacts()
 
     def _load_artifacts(self):
+        # 1. Load Classification Pipeline
         bundle = joblib.load(self.model_path)
         if isinstance(bundle, dict):
             self.pipeline = bundle.get("pipeline")
@@ -106,17 +125,35 @@ class ECGPredictor:
             self.label_encoder = None
 
         if self.pipeline is None:
-            raise ValueError(f"Failed to load pipeline from {self.model_path}")
+            raise ValueError(f"Failed to load classification pipeline from {self.model_path}")
 
-    def prepare_features(self, input_df):
+        # 2. Load Regression Pipeline (Biological Age)
+        self.reg_pipeline = None
+        self.reg_feature_names = []
+        if os.path.exists(self.reg_model_path):
+            try:
+                reg_bundle = joblib.load(self.reg_model_path)
+                if isinstance(reg_bundle, dict):
+                    self.reg_pipeline = reg_bundle.get("pipeline")
+                    self.reg_feature_names = reg_bundle.get("feature_names", self.feature_names)
+                else:
+                    self.reg_pipeline = reg_bundle
+                    self.reg_feature_names = self.feature_names
+            except Exception:
+                self.reg_pipeline = None
+
+    def prepare_features(self, input_df, target_features=None):
         """
         Ensures all expected features are present, calculates the physiological
         qtc_qrs_ratio, and applies delineation guard masking.
+        Missing values are populated with np.nan so the trained pipeline's
+        SimpleImputer(strategy='median') accurately populates population medians.
         """
         df = input_df.copy()
+        feat_list = target_features if target_features is not None else self.feature_names
 
         # 1. Derive repolarization/depolarization ratio
-        if "qtc_qrs_ratio" not in df.columns:
+        if "qtc_qrs_ratio" not in df.columns or df["qtc_qrs_ratio"].isna().all():
             if "qtc_mean_ms" in df.columns and "qrs_dur_mean_ms" in df.columns:
                 qrs_safe = df["qrs_dur_mean_ms"].replace(0, np.nan)
                 df["qtc_qrs_ratio"] = df["qtc_mean_ms"] / qrs_safe
@@ -124,8 +161,9 @@ class ECGPredictor:
                 df["qtc_qrs_ratio"] = np.nan
 
         # 2. Derive RR interval if heart rate is provided
-        if "rr_mean_ms" not in df.columns and "hr_bpm" in df.columns:
-            df["rr_mean_ms"] = 60000.0 / df["hr_bpm"].replace(0, np.nan)
+        if "rr_mean_ms" not in df.columns or df["rr_mean_ms"].isna().all():
+            if "hr_bpm" in df.columns:
+                df["rr_mean_ms"] = 60000.0 / df["hr_bpm"].replace(0, np.nan)
 
         # 3. Guard masking on unverified beats
         if "delineation_ok" in df.columns:
@@ -135,17 +173,23 @@ class ECGPredictor:
                     df.loc[unreliable, gc] = np.nan
 
         # 4. Fill missing expected columns with NaN (the pipeline imputer will handle them)
-        for col in self.feature_names:
+        for col in feat_list:
             if col not in df.columns:
                 df[col] = np.nan
 
         # Order columns exactly as expected by the trained pipeline
-        return df[self.feature_names]
+        return df[feat_list]
 
     def predict(self, data):
         """
         Accepts dict, Series, or DataFrame.
-        Returns prediction dictionary with diagnostic class, probabilities, and clinical alerts.
+        Returns prediction dictionary (or list of dicts) with:
+          - predicted_class: Primary diagnostic pathology (MI, CD, HYP, STTC, NORM)
+          - description: Clinical description of the condition
+          - confidence: Model prediction probability
+          - probabilities: Full class distribution
+          - estimated_age: Predicted biological patient age (years)
+          - clinical_flags: Actionable electrophysiological alerts
         """
         if isinstance(data, dict):
             df_in = pd.DataFrame([data])
@@ -159,10 +203,10 @@ class ECGPredictor:
         else:
             raise TypeError("Input data must be a dict, pd.Series, or pd.DataFrame")
 
-        warnings.filterwarnings("ignore")
-        X_prep = self.prepare_features(df_in)
+        X_prep = self.prepare_features(df_in, target_features=self.feature_names)
+        X_arr = X_prep.values
 
-        # Get exact class label order from the underlying estimator
+        # Determine exact class label order from the underlying estimator
         model_step = getattr(self.pipeline, "named_steps", {}).get("model", self.pipeline)
         if hasattr(model_step, "classes_"):
             raw_classes = list(model_step.classes_)
@@ -173,19 +217,28 @@ class ECGPredictor:
         else:
             model_class_labels = self.class_names
 
-        # Predict raw outputs using values to avoid feature name mismatch warning
-        X_arr = X_prep.values
+        # Classification inference
         if hasattr(self.pipeline, "predict_proba"):
             probas = self.pipeline.predict_proba(X_arr)
         else:
             probas = None
 
         preds_raw = self.pipeline.predict(X_arr)
-
         if self.label_encoder is not None:
             preds_str = self.label_encoder.inverse_transform(preds_raw)
         else:
             preds_str = [str(p) for p in preds_raw]
+
+        # Biological Age Regression inference
+        if self.reg_pipeline is not None:
+            reg_feat_list = self.reg_feature_names if self.reg_feature_names else self.feature_names
+            X_reg_prep = self.prepare_features(df_in, target_features=reg_feat_list)
+            try:
+                age_preds = self.reg_pipeline.predict(X_reg_prep.values)
+            except Exception:
+                age_preds = [np.nan] * len(df_in)
+        else:
+            age_preds = [np.nan] * len(df_in)
 
         results = []
         for idx in range(len(df_in)):
@@ -200,6 +253,8 @@ class ECGPredictor:
             else:
                 confidence = None
 
+            est_age = float(age_preds[idx]) if not np.isnan(age_preds[idx]) else None
+
             row_record = df_in.iloc[idx].to_dict()
             clinical_flags = self._generate_clinical_flags(row_record, pred_class)
 
@@ -208,6 +263,7 @@ class ECGPredictor:
                 "description": CLASS_DESCRIPTIONS.get(pred_class, "Cardiac condition"),
                 "confidence": confidence,
                 "probabilities": prob_dict,
+                "estimated_age": est_age,
                 "clinical_flags": clinical_flags
             })
 
@@ -264,17 +320,18 @@ class ECGPredictor:
         return flags
 
 
-def print_prediction_card(res, ecg_id=None, true_label=None):
+def print_prediction_card(res, ecg_id=None, true_label=None, true_age=None):
     """
     Renders an ASCII clinical report card to the terminal.
     """
     pred = res["predicted_class"]
     conf = res["confidence"]
     probs = res["probabilities"]
+    age = res.get("estimated_age")
     flags = res["clinical_flags"]
 
     print("=" * 75)
-    header = f"ECG DIAGNOSTIC PREDICTION REPORT"
+    header = "ECG DIAGNOSTIC PREDICTION REPORT"
     if ecg_id is not None:
         header += f" (Record ID: {ecg_id})"
     print(header.center(75))
@@ -288,6 +345,13 @@ def print_prediction_card(res, ecg_id=None, true_label=None):
 
     if conf is not None:
         print(f"  Confidence        : {conf * 100:.1f}%")
+
+    if age is not None:
+        if true_age is not None and not pd.isna(true_age):
+            delta = age - true_age
+            print(f"  Estimated Bio Age : {age:.1f} years  (Chronological: {true_age:.0f} yrs, Delta: {delta:+.1f} yrs)")
+        else:
+            print(f"  Estimated Bio Age : {age:.1f} years")
 
     print("\n  Class Probability Distribution:")
     print("  " + "-" * 55)
@@ -308,17 +372,19 @@ def print_prediction_card(res, ecg_id=None, true_label=None):
 
 def run_demo(predictor):
     """
-    Demonstrates model predictions across diverse representative cases from the dataset.
+    Demonstrates model predictions across representative clinical benchmark cases
+    from the unseen test fold (Fold 10).
     """
     feat_file = os.path.join(DATA_DIR, "stage4_features.csv")
     label_file = os.path.join(DATA_DIR, "ptbxl_labels.csv")
+    meta_file = os.path.join(DATA_DIR, "ptbxl_metadata.csv")
 
     if not (os.path.exists(feat_file) and os.path.exists(label_file)):
         print("Dataset files not found for demo. Predicting on synthetic clinical prototypes instead:\n")
         prototypes = [
-            {"name": "Acute MI Prototype", "data": {"hr_bpm": 85, "pr_mean_ms": 165, "qrs_dur_mean_ms": 95, "qtc_mean_ms": 420, "st_level_median_mv": 0.25, "t_area_median": -15.0}},
-            {"name": "Conduction Delay Prototype", "data": {"hr_bpm": 68, "pr_mean_ms": 220, "qrs_dur_mean_ms": 145, "qtc_mean_ms": 460, "st_level_median_mv": -0.02, "rs_ratio_median": 0.35}},
-            {"name": "Normal Sinus Prototype", "data": {"hr_bpm": 70, "pr_mean_ms": 150, "qrs_dur_mean_ms": 90, "qtc_mean_ms": 405, "st_level_median_mv": 0.01, "t_area_median": 8.0}}
+            {"name": "Acute MI Prototype", "data": {"hr_bpm": 85, "pr_mean_ms": 165, "qrs_dur_mean_ms": 95, "qtc_mean_ms": 420, "st_level_median_mv": 0.25, "t_area_median": -0.015}},
+            {"name": "Conduction Delay Prototype", "data": {"hr_bpm": 68, "pr_mean_ms": 220, "qrs_dur_mean_ms": 155, "qtc_mean_ms": 460, "st_level_median_mv": -0.02, "rs_ratio_median": 0.35, "t_area_median": 0.005}},
+            {"name": "Normal Sinus Prototype", "data": {"hr_bpm": 70, "pr_mean_ms": 150, "qrs_dur_mean_ms": 90, "qtc_mean_ms": 405, "st_level_median_mv": 0.01, "t_area_median": 0.008}}
         ]
         for p in prototypes:
             print(f"--- Prototype: {p['name']} ---")
@@ -328,6 +394,7 @@ def run_demo(predictor):
 
     f_df = pd.read_csv(feat_file)
     l_df = pd.read_csv(label_file)
+    m_df = pd.read_csv(meta_file) if os.path.exists(meta_file) else None
 
     priority_cols = ['label_MI', 'label_CD', 'label_HYP', 'label_STTC', 'label_NORM']
     class_names = ['MI', 'CD', 'HYP', 'STTC', 'NORM']
@@ -340,22 +407,27 @@ def run_demo(predictor):
 
     l_df['dom'] = l_df.apply(get_dom, axis=1)
     merged = f_df.merge(l_df[['ecg_id', 'dom', 'fold']], on='ecg_id', how='inner')
+    if m_df is not None:
+        merged = merged.merge(m_df[['ecg_id', 'age', 'sex']], on='ecg_id', how='left')
 
-    # Pick 1 representative test-set case for each diagnostic category
     test_cases = merged[merged['fold'] == 'test']
-    print(f"Demonstration: Evaluating 5 Clinical Cases from Unseen Test Fold (Fold 10)...\n")
+    print("Demonstration: Evaluating 5 Clinical Benchmark Cases from Unseen Test Fold (Fold 10)...\n")
 
     for target in CLASS_NAMES:
-        match = test_cases[test_cases['dom'] == target]
+        eid = REPRESENTATIVE_TEST_CASES.get(target)
+        match = test_cases[test_cases['ecg_id'] == eid]
+        if match.empty:
+            match = test_cases[test_cases['dom'] == target]
         if not match.empty:
             case = match.iloc[0]
-            eid = int(case['ecg_id'])
+            true_label = case.get('dom', target)
+            true_age = case.get('age') if 'age' in case else None
             res = predictor.predict(case)
-            print_prediction_card(res, ecg_id=eid, true_label=target)
+            print_prediction_card(res, ecg_id=int(case['ecg_id']), true_label=true_label, true_age=true_age)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="PTB-XL ECG Diagnostic Prediction Engine (Classification Part B)")
+    parser = argparse.ArgumentParser(description="PTB-XL ECG Diagnostic & Prognostic Prediction Engine")
     parser.add_argument("--demo", action="store_true", help="Run demonstration on 5 representative clinical cases")
     parser.add_argument("--ecg-id", type=int, default=None, help="Look up record by ECG ID from dataset and predict")
     parser.add_argument("--csv", type=str, default=None, help="Path to input CSV containing ECG features for batch prediction")
@@ -367,8 +439,8 @@ def main():
     parser.add_argument("--pr", type=float, default=None, help="PR interval duration in ms (e.g. 160.0)")
     parser.add_argument("--qrs", type=float, default=None, help="QRS complex duration in ms (e.g. 95.0)")
     parser.add_argument("--qtc", type=float, default=None, help="Bazett-corrected QTc interval in ms (e.g. 415.0)")
-    parser.add_argument("--st", type=float, default=None, help="ST-segment amplitude level in mV (e.g. 0.15)")
-    parser.add_argument("--t-area", type=float, default=None, help="T-wave integrated area (e.g. 8.5)")
+    parser.add_argument("--st", type=float, default=None, help="ST-segment amplitude level in mV (e.g. -0.02)")
+    parser.add_argument("--t-area", type=float, default=None, help="T-wave integrated area in mV·s (e.g. 0.008)")
 
     args = parser.parse_args()
 
@@ -383,6 +455,7 @@ def main():
     if args.ecg_id is not None:
         feat_path = os.path.join(DATA_DIR, "stage4_features.csv")
         labels_path = os.path.join(DATA_DIR, "ptbxl_labels.csv")
+        meta_path = os.path.join(DATA_DIR, "ptbxl_metadata.csv")
 
         if not os.path.exists(feat_path):
             print(f"Error: Feature dataset not found at {feat_path}")
@@ -407,8 +480,17 @@ def main():
                         true_label = name
                         break
 
+        true_age = None
+        if os.path.exists(meta_path):
+            m_df = pd.read_csv(meta_path)
+            m_row = m_df[m_df["ecg_id"] == args.ecg_id]
+            if not m_row.empty and 'age' in m_row:
+                age_val = m_row.iloc[0]['age']
+                if not pd.isna(age_val) and age_val < 300:
+                    true_age = float(age_val)
+
         res = predictor.predict(record.iloc[0])
-        print_prediction_card(res, ecg_id=args.ecg_id, true_label=true_label)
+        print_prediction_card(res, ecg_id=args.ecg_id, true_label=true_label, true_age=true_age)
         return
 
     # 3. Batch prediction on CSV
@@ -425,6 +507,7 @@ def main():
         output_df = input_df.copy()
         output_df["predicted_diagnosis"] = [r["predicted_class"] for r in results]
         output_df["confidence"] = [r["confidence"] for r in results]
+        output_df["estimated_age"] = [r.get("estimated_age") for r in results]
 
         for cls in CLASS_NAMES:
             output_df[f"prob_{cls}"] = [r["probabilities"].get(cls, np.nan) for r in results]
