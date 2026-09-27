@@ -1,0 +1,19 @@
+{
+  "output": {
+    "filePath": "repomix-output.xml",
+    "style": "xml",
+    "truncateBase64": true
+  },
+  "ignore": {
+    "useGitignore": true,
+    "useDefaultPatterns": true,
+    "customPatterns": [
+      "data/stage4_features*.csv",
+      "data/ptbxl*.csv",
+      "data/split_indices.json",
+      "*.log",
+      "repomix-output.xml",
+      "repomix-output.md"
+    ]
+  }
+}
